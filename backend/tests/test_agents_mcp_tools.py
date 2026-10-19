@@ -53,6 +53,7 @@ def test_registry_contains_v1_tools():
         "list_recurring_transactions",
         "list_assets",
         "list_goals",
+        "propose_asset_purchase_backfill",
     }
     assert expected.issubset(set(REGISTRY.keys())), (
         f"missing: {expected - set(REGISTRY.keys())}"
@@ -60,7 +61,13 @@ def test_registry_contains_v1_tools():
 
 
 def test_proposal_tools_marked_is_proposal():
-    for name in ("propose_categorize", "propose_create_category", "propose_create_budget", "propose_create_payee_rule"):
+    for name in (
+        "propose_categorize",
+        "propose_create_category",
+        "propose_create_budget",
+        "propose_create_payee_rule",
+        "propose_asset_purchase_backfill",
+    ):
         spec = REGISTRY[name]
         assert spec.is_proposal, f"{name} should have is_proposal=True"
 
