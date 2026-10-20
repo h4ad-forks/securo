@@ -640,9 +640,13 @@ async def sync_opening_balance_for_connected_account(
     is_cc = account.type == "credit_card"
     target = -account.balance if is_cc else account.balance
 
+    # Only count a cross-currency row once it has a primary-currency value.
+    # The provider balance is the target, so an unconverted foreign row must
+    # not be treated as 1:1 and inflate the synthetic opening balance (issue
+    # #353). This mirrors _signed_amount_expr.
     effective_amount = case(
         (Transaction.currency == account.currency, Transaction.amount),
-        else_=func.coalesce(Transaction.amount_primary, Transaction.amount),
+        else_=func.coalesce(Transaction.amount_primary, 0),
     )
     signed_amount = case(
         (Transaction.type == "credit", effective_amount),
@@ -1164,10 +1168,17 @@ async def get_period_opening_balance(
 
 def _signed_amount_expr(account_currency: str):
     """credit → +amount, debit → −amount.
-    Uses amount_primary only when tx currency differs from account currency."""
+
+    A cross-currency row only has a usable account-currency value when
+    ``amount_primary`` was stamped. Falling back to the native amount here
+    treats 700,000 CLP as 700,000 BRL and corrupts every balance derived from
+    the ledger (issue #353). Leave unconverted rows out of the account-currency
+    balance instead; the synthetic opening balance still reconciles a connected
+    account to the provider's reported balance.
+    """
     effective = case(
         (Transaction.currency == account_currency, Transaction.amount),
-        else_=func.coalesce(Transaction.amount_primary, Transaction.amount),
+        else_=func.coalesce(Transaction.amount_primary, 0),
     )
     return case(
         (Transaction.type == "credit", effective),
