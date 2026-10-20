@@ -15,6 +15,8 @@ unchanged for Securo's own UI.
 
 from __future__ import annotations
 
+import uuid
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -38,7 +40,7 @@ from app.schemas.recurring_transaction import (
     WeekendAdjustment,
 )
 from app.schemas.rule import RuleAction, RuleCondition, RuleCreate
-from app.schemas.transaction import TransactionCreate
+from app.schemas.transaction import TransactionCreate, TransactionUpdate
 from app.schemas.transaction_split import TransactionSplitInput, TransactionSplitsInput
 from app.services import (
     budget_service,
@@ -1507,3 +1509,272 @@ async def propose_merge_payees(
         }
 
     return preview
+
+
+def _json_scalar(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return value
+
+
+async def _transaction_snapshot(
+    session: AsyncSession, tx: Transaction
+) -> dict[str, Any]:
+    account = await session.get(Account, tx.account_id) if tx.account_id else None
+    return {
+        "id": str(tx.id),
+        "date": tx.date.isoformat() if tx.date else None,
+        "description": tx.description,
+        "amount": num(tx.amount),
+        "currency": tx.currency,
+        "amount_primary": num(tx.amount_primary),
+        "fx_rate_used": num(tx.fx_rate_used),
+        "type": tx.type,
+        "status": tx.status,
+        "account_id": str(tx.account_id) if tx.account_id else None,
+        "account_name": account.name if account else None,
+        "category_id": str(tx.category_id) if tx.category_id else None,
+        "category_name": tx.category.name if tx.category else None,
+        "payee_id": str(tx.payee_id) if tx.payee_id else None,
+        "payee_name": tx.payee_entity.name if tx.payee_entity else None,
+        "notes": tx.notes,
+        "is_ignored": bool(tx.is_ignored),
+        "exclude_from_pnl": bool(tx.exclude_from_pnl),
+        "is_transfer": bool(tx.transfer_pair_id),
+    }
+
+
+@tool(
+    name="propose_update_transaction",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Build a preview for editing one transaction. Pass the transaction_id "
+        "and only the fields to change. Supports the same fields as the API's "
+        "PATCH /api/transactions/{id}. For a foreign-currency row, set "
+        "`amount_primary` to the value in the user's primary currency (for "
+        "example BRL), or set `fx_rate_used` and let Securo derive it. "
+        "`clear_fx=true` removes a manual FX override and restamps the row "
+        "from the current rate. Returns the current values next to the "
+        "proposed ones, and shows the derived FX counterpart when relevant."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "transaction_id": {"type": "string", "format": "uuid"},
+            "description": {"type": "string", "minLength": 1, "maxLength": 500},
+            "amount": {"type": "number", "exclusiveMinimum": 0},
+            "date": {"type": "string", "format": "date"},
+            "type": {"type": "string", "enum": ["debit", "credit"]},
+            "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+            "account_id": {"type": "string", "format": "uuid"},
+            "category_id": {"type": "string", "format": "uuid"},
+            "payee_id": {"type": "string", "format": "uuid"},
+            "notes": {"type": "string", "maxLength": 1000},
+            "amount_primary": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": (
+                    "Value in the user's primary currency (BRL for this "
+                    "workspace). Setting it alone derives "
+                    "fx_rate_used = amount_primary / amount."
+                ),
+            },
+            "fx_rate_used": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": (
+                    "Rate from the transaction currency to the primary "
+                    "currency. Setting it alone derives "
+                    "amount_primary = amount * fx_rate_used."
+                ),
+            },
+            "is_ignored": {"type": "boolean"},
+            "exclude_from_pnl": {"type": "boolean"},
+            "status": {"type": "string", "enum": ["posted", "pending"]},
+            "apply_to_transfer_pair": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Also apply amount, date, description and notes (and "
+                    "category, when provided) to the other leg of a transfer "
+                    "pair."
+                ),
+            },
+            "clear_fx": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Remove the manual FX override and let Securo restamp the "
+                    "primary amount. Cannot be combined with amount_primary "
+                    "or fx_rate_used."
+                ),
+            },
+            "apply": _APPLY_FIELD,
+        },
+        "required": ["transaction_id"],
+        "additionalProperties": False,
+    },
+    is_proposal=True,
+    tags=["propose", "transactions"],
+)
+async def propose_update_transaction(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    transaction_id: str,
+    description: str | None = None,
+    amount: float | None = None,
+    date: str | None = None,
+    type: str | None = None,
+    currency: str | None = None,
+    account_id: str | None = None,
+    category_id: str | None = None,
+    payee_id: str | None = None,
+    notes: str | None = None,
+    amount_primary: float | None = None,
+    fx_rate_used: float | None = None,
+    is_ignored: bool | None = None,
+    exclude_from_pnl: bool | None = None,
+    status: str | None = None,
+    apply_to_transfer_pair: bool = False,
+    clear_fx: bool = False,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    tx_id = parse_uuid(transaction_id)
+    tx = (
+        await transaction_service.get_transaction(session, tx_id, ws_id)
+        if tx_id
+        else None
+    )
+    if tx is None:
+        return {"error": "transaction not found"}
+
+    if clear_fx and (amount_primary is not None or fx_rate_used is not None):
+        return {
+            "error": (
+                "clear_fx cannot be combined with amount_primary or "
+                "fx_rate_used"
+            )
+        }
+
+    changes: dict[str, Any] = {}
+    if description is not None:
+        cleaned = description.strip()
+        if not cleaned:
+            return {"error": "description cannot be empty"}
+        changes["description"] = cleaned
+    if amount is not None:
+        parsed_amount = Decimal(str(amount))
+        if parsed_amount <= 0:
+            return {"error": "amount must be greater than zero"}
+        changes["amount"] = parsed_amount
+    if date is not None:
+        parsed_date = parse_date(date)
+        if parsed_date is None:
+            return {"error": "date cannot be empty"}
+        changes["date"] = parsed_date
+    if type is not None:
+        changes["type"] = type
+    if currency is not None:
+        changes["currency"] = currency.strip().upper()
+    if account_id is not None:
+        parsed_account = parse_uuid(account_id)
+        if parsed_account is None:
+            return {"error": "account_id cannot be empty"}
+        changes["account_id"] = parsed_account
+    if category_id is not None:
+        parsed_category = parse_uuid(category_id)
+        if parsed_category is None:
+            return {"error": "category_id cannot be empty"}
+        changes["category_id"] = parsed_category
+    if payee_id is not None:
+        parsed_payee = parse_uuid(payee_id)
+        if parsed_payee is None:
+            return {"error": "payee_id cannot be empty"}
+        changes["payee_id"] = parsed_payee
+    if notes is not None:
+        changes["notes"] = notes
+    if amount_primary is not None:
+        parsed_primary = Decimal(str(amount_primary))
+        if parsed_primary <= 0:
+            return {"error": "amount_primary must be greater than zero"}
+        changes["amount_primary"] = parsed_primary
+    if fx_rate_used is not None:
+        parsed_rate = Decimal(str(fx_rate_used))
+        if parsed_rate <= 0:
+            return {"error": "fx_rate_used must be greater than zero"}
+        changes["fx_rate_used"] = parsed_rate
+    if is_ignored is not None:
+        changes["is_ignored"] = bool(is_ignored)
+    if exclude_from_pnl is not None:
+        changes["exclude_from_pnl"] = bool(exclude_from_pnl)
+    if status is not None:
+        changes["status"] = status
+    if apply_to_transfer_pair:
+        changes["apply_to_transfer_pair"] = True
+    if clear_fx:
+        changes["amount_primary"] = None
+        changes["fx_rate_used"] = None
+
+    if not changes:
+        return {"error": "no changes provided"}
+
+    preview: dict[str, Any] = {
+        "kind": "update_transaction",
+        "target": await _transaction_snapshot(session, tx),
+        "changes": {key: _json_scalar(value) for key, value in changes.items()},
+        "apply_endpoint": f"PATCH /api/transactions/{tx.id}",
+    }
+
+    new_amount = changes.get("amount", tx.amount)
+    if amount_primary is not None:
+        preview["derived"] = {
+            "fx_rate_used": num(
+                (
+                    Decimal(str(amount_primary))
+                    / Decimal(str(new_amount))
+                ).quantize(Decimal("0.0000000001"))
+            )
+        }
+    elif fx_rate_used is not None:
+        preview["derived"] = {
+            "amount_primary": num(
+                (
+                    Decimal(str(new_amount))
+                    * Decimal(str(fx_rate_used))
+                ).quantize(Decimal("0.01"))
+            )
+        }
+    elif clear_fx:
+        preview["derived"] = {
+            "amount_primary": "auto",
+            "fx_rate_used": "auto",
+        }
+
+    if not _can_apply(ctx, apply):
+        return preview
+
+    try:
+        updated = await transaction_service.update_transaction(
+            session,
+            tx.id,
+            ws_id,
+            ctx.user_id,
+            TransactionUpdate(**changes),
+        )
+    except (ValueError, ArithmeticError) as exc:
+        return {**preview, "applied": False, "error": str(exc)}
+    if updated is None:
+        return {**preview, "applied": False, "error": "transaction not found"}
+
+    fresh = await transaction_service.get_transaction(session, updated.id, ws_id)
+    return {
+        **preview,
+        "applied": True,
+        "transaction": await _transaction_snapshot(session, fresh or updated),
+    }
