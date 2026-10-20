@@ -1163,11 +1163,16 @@ async def get_projected_transactions(
 
 def _signed_balance_expr(account_currency: str = ""):
     """Reusable SQL expression: credit → +amount, debit → −amount.
-    Uses amount_primary when tx currency differs from account currency."""
+
+    A cross-currency row only has a usable account-currency value when
+    ``amount_primary`` was stamped. Falling back to the native amount treats
+    700,000 CLP as 700,000 BRL and corrupts the historical balance for a
+    connected account (issue #353). Leave unconverted rows out instead.
+    """
     if account_currency:
         effective = case(
             (Transaction.currency == account_currency, Transaction.amount),
-            else_=func.coalesce(Transaction.amount_primary, Transaction.amount),
+            else_=func.coalesce(Transaction.amount_primary, 0),
         )
     else:
         effective = Transaction.amount
@@ -1178,12 +1183,16 @@ def _signed_balance_expr(account_currency: str = ""):
 
 
 def _signed_transaction_amount(tx: Transaction) -> float:
-    """Return a loaded transaction's signed amount in its account currency."""
+    """Return a loaded transaction's signed amount in its account currency.
+
+    An unconverted cross-currency row contributes zero rather than being read
+    1:1, for the same reason as ``_signed_balance_expr`` (issue #353).
+    """
     account_currency = tx.account.currency if tx.account else tx.currency
     amount = (
         tx.amount
         if tx.currency == account_currency
-        else (tx.amount_primary or tx.amount)
+        else (tx.amount_primary or 0)
     )
     signed = amount if tx.type == "credit" else -amount
     return float(signed)
