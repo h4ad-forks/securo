@@ -1,4 +1,4 @@
-"""Tests for the asset purchase backfill proposal tool."""
+"""Tests for the asset proposal tools: creation and purchase backfill."""
 
 import uuid
 from datetime import date
@@ -301,3 +301,164 @@ async def test_ambiguous_ticker_is_reported(
 
     assert result["inserted_values"] == 0
     assert any("more than one" in error for error in result["errors"])
+
+
+# --- propose_create_asset --------------------------------------------------
+
+
+async def test_create_asset_preview_does_not_write(
+    session: AsyncSession, ctx: CallContext
+):
+    """A manual holding previews its value and cost basis and touches nothing."""
+    handler = REGISTRY["propose_create_asset"].handler
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        name="Corolla 2021",
+        type="vehicle",
+        currency="BRL",
+        current_value=32000.0,
+        purchase_date="2023-11-05",
+        purchase_price=40000.0,
+    )
+
+    assert result["kind"] == "create_asset"
+    assert result.get("applied") is not True
+    assert result["errors"] == []
+    assert result["name_collision"] is None
+    assert result["proposed"]["name"] == "Corolla 2021"
+    assert result["proposed"]["type"] == "vehicle"
+    assert result["proposed"]["purchase_date"] == "2023-11-05"
+    assert result["gain_loss_if_applied"] == -8000.0
+
+    count = (await session.execute(select(func.count()).select_from(Asset))).scalar_one()
+    assert count == 0
+
+
+async def test_create_asset_flags_name_collision(
+    session: AsyncSession, ctx: CallContext, test_user, test_workspace
+):
+    session.add(
+        Asset(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            name="Corolla 2021",
+            type="vehicle",
+            currency="BRL",
+            source="manual",
+        )
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_create_asset"].handler
+    result = await handler(
+        session=session, ctx=ctx, name="corolla 2021", type="vehicle"
+    )
+
+    assert result["name_collision"] is not None
+    assert result["name_collision"]["name"] == "Corolla 2021"
+
+
+async def test_create_asset_refuses_collision_on_apply(
+    session: AsyncSession, ctx: CallContext, test_user, test_workspace
+):
+    session.add(
+        Asset(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            name="Corolla 2021",
+            type="vehicle",
+            currency="BRL",
+            source="manual",
+        )
+    )
+    await session.commit()
+    before = (await session.execute(select(func.count()).select_from(Asset))).scalar_one()
+
+    handler = REGISTRY["propose_create_asset"].handler
+    result = await handler(
+        session=session, ctx=ctx, name="Corolla 2021", type="vehicle", apply=True
+    )
+
+    assert result.get("applied") is not True
+    assert "already exists" in result["error"]
+    after = (await session.execute(select(func.count()).select_from(Asset))).scalar_one()
+    assert after == before
+
+
+async def test_create_asset_reports_invalid_combination(
+    session: AsyncSession, ctx: CallContext
+):
+    handler = REGISTRY["propose_create_asset"].handler
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        name="Corolla 2021",
+        type="vehicle",
+        sell_price=25000.0,
+    )
+
+    assert any("sell_date is required" in error for error in result["errors"])
+    assert result.get("applied") is not True
+
+
+async def test_create_asset_rejects_unknown_type(
+    session: AsyncSession, ctx: CallContext
+):
+    handler = REGISTRY["propose_create_asset"].handler
+    result = await handler(session=session, ctx=ctx, name="Drone", type="gadget")
+
+    assert any("type must be one of" in error for error in result["errors"])
+
+
+async def test_create_asset_apply_writes_row_and_value(
+    session: AsyncSession, ctx: CallContext
+):
+    """The row keeps both the current value and the purchase cost, which is
+    what makes a later sale measurable as gain/loss."""
+    handler = REGISTRY["propose_create_asset"].handler
+
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        name="Corolla 2021",
+        type="vehicle",
+        currency="BRL",
+        current_value=32000.0,
+        purchase_date="2023-11-05",
+        purchase_price=40000.0,
+        apply=True,
+    )
+
+    assert result.get("applied") is True
+    assert result["gain_loss"] == -8000.0
+
+    asset = (
+        await session.execute(
+            select(Asset).where(Asset.id == uuid.UUID(result["id"]))
+        )
+    ).scalar_one()
+    assert asset.name == "Corolla 2021"
+    assert asset.type == "vehicle"
+    assert asset.currency == "BRL"
+    assert asset.source == "manual"
+    purchase_price = asset.purchase_price
+    purchase_date = asset.purchase_date
+    assert purchase_price is not None
+    assert purchase_date is not None
+    assert float(purchase_price) == 40000.0
+    assert purchase_date == date(2023, 11, 5)
+
+    values = (
+        (
+            await session.execute(
+                select(AssetValue).where(AssetValue.asset_id == asset.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(values) == 1
+    assert float(values[0].amount) == 32000.0

@@ -1,11 +1,17 @@
-"""Asset purchase backfill.
+"""Asset creation and purchase backfill.
+
+``propose_create_asset`` covers the other half of the lifecycle: a manual
+holding that does not exist in Securo yet (a car, a house, a piece of
+equipment). It seeds the current value and the purchase cost in one call, so
+the purchase can be kept out of spending and the gain/loss is computable from
+the moment the asset is created.
 
 Manual assets created from a position snapshot have a current value but no
 purchase history. Net-worth reports before that snapshot then treat the
-holding as zero. This tool previews and applies a purchase-lot history for
-those holdings: it sets ``purchase_date`` and ``purchase_price`` and inserts
-one manual ``asset_values`` row per purchase date with the cumulative amount
-invested up to that date.
+holding as zero. ``propose_asset_purchase_backfill`` previews and applies a
+purchase-lot history for those holdings: it sets ``purchase_date`` and
+``purchase_price`` and inserts one manual ``asset_values`` row per purchase
+date with the cumulative amount invested up to that date.
 
 Lots can be passed explicitly, for statement data that is not in Securo yet,
 or derived from debit transactions whose description starts with a known
@@ -29,14 +35,259 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
+from app.models.asset_group import AssetGroup
 from app.models.asset_transaction import AssetTransaction
 from app.models.asset_value import AssetValue
 from app.models.transaction import Transaction
+from app.models.workspace import Workspace
+from app.schemas.asset import AssetCreate
+from app.services import asset_service
 from app.services.fx_rate_service import stamp_primary_amount
 from mcp_server.auth import CallContext
 from mcp_server.registry import tool
-from mcp_server.tools._helpers import parse_date, parse_uuid, resolve_workspace_id
+from mcp_server.tools._helpers import num, parse_date, parse_uuid, resolve_workspace_id
 from mcp_server.tools.proposals import _APPLY_FIELD, _PROPOSAL_PREFACE, _can_apply
+
+
+_ASSET_TYPES = ("real_estate", "vehicle", "valuable", "investment", "other")
+_MAX_ASSET_NAME = 255
+
+_CREATE_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": _MAX_ASSET_NAME,
+            "description": "Holding name, e.g. 'Corolla 2021' or 'Apartamento'. Used for duplicate detection.",
+        },
+        "type": {
+            "type": "string",
+            "enum": list(_ASSET_TYPES),
+            "default": "other",
+            "description": "Asset class. Cars are 'vehicle'.",
+        },
+        "currency": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3,
+            "description": "ISO code. Defaults to the workspace's default currency.",
+        },
+        "current_value": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": (
+                "What the holding is worth today, not what it cost. This is "
+                "the value that feeds net worth and the gain/loss figure."
+            ),
+        },
+        "purchase_date": {"type": "string", "format": "date"},
+        "purchase_price": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Total cash paid for the holding, in the asset currency.",
+        },
+        "sell_date": {
+            "type": "string",
+            "format": "date",
+            "description": "Disposal date. Requires sell_price.",
+        },
+        "sell_price": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Amount received on disposal, in the asset currency. Requires sell_date.",
+        },
+        "group_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional asset group (wallet) to file the holding under.",
+        },
+        "apply": _APPLY_FIELD,
+    },
+    "required": ["name"],
+    "additionalProperties": False,
+}
+
+
+def _parse_positive_money(raw: Any, label: str, errors: list[str]) -> Decimal | None:
+    if raw is None:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        errors.append(f"{label} is not a number")
+        return None
+    if value <= 0:
+        errors.append(f"{label} must be greater than zero")
+        return None
+    return _money(value)
+
+
+@tool(
+    name="propose_create_asset",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Preview the creation of a manual holding (car, house, equipment, "
+        "anything that should sit on the balance sheet instead of counting as "
+        "spending). Pass current_value for what it is worth today and "
+        "purchase_price for what it cost: Securo keeps both and reports the "
+        "difference as gain/loss, so a later sale is measurable. sell_date and "
+        "sell_price record a disposal. Manual valuation only; ticker-priced "
+        "holdings are created through the market-price flow. Run it once "
+        "without apply to review, and check name_collision before applying."
+    ),
+    parameters=_CREATE_PARAMETERS,
+    is_proposal=True,
+    tags=["propose", "assets"],
+)
+async def propose_create_asset(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    name: str,
+    type: str = "other",
+    currency: str | None = None,
+    current_value: float | None = None,
+    purchase_date: str | None = None,
+    purchase_price: float | None = None,
+    sell_date: str | None = None,
+    sell_price: float | None = None,
+    group_id: str | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    errors: list[str] = []
+
+    clean_name = " ".join(str(name or "").split())
+    if not clean_name:
+        errors.append("name is required")
+    elif len(clean_name) > _MAX_ASSET_NAME:
+        errors.append(f"name must be at most {_MAX_ASSET_NAME} characters")
+
+    asset_type = str(type or "").strip().lower()
+    if asset_type not in _ASSET_TYPES:
+        errors.append(f"type must be one of {', '.join(_ASSET_TYPES)}")
+
+    workspace_currency = await session.scalar(
+        select(Workspace.default_currency).where(Workspace.id == ws_id)
+    )
+    code = (currency or workspace_currency or "USD").strip().upper()
+    if len(code) != 3 or not code.isalpha():
+        errors.append("currency must be a three-letter code")
+
+    try:
+        parsed_purchase_date = parse_date(purchase_date)
+        parsed_sell_date = parse_date(sell_date)
+    except ValueError:
+        errors.append("purchase_date and sell_date must be valid ISO dates")
+        parsed_purchase_date = parsed_sell_date = None
+
+    value_today = _parse_positive_money(current_value, "current_value", errors)
+    cost = _parse_positive_money(purchase_price, "purchase_price", errors)
+    proceeds = _parse_positive_money(sell_price, "sell_price", errors)
+
+    if proceeds is not None and parsed_sell_date is None:
+        errors.append("sell_date is required when sell_price is set")
+    if parsed_sell_date is not None and proceeds is None:
+        errors.append("sell_price is required when sell_date is set")
+    if (
+        parsed_purchase_date is not None
+        and parsed_sell_date is not None
+        and parsed_sell_date < parsed_purchase_date
+    ):
+        errors.append("sell_date cannot be before purchase_date")
+
+    group_uuid: uuid.UUID | None = None
+    if group_id:
+        try:
+            group_uuid = parse_uuid(group_id)
+        except (TypeError, ValueError):
+            errors.append("group_id is not a UUID")
+        else:
+            if group_uuid is not None:
+                found = await session.scalar(
+                    select(AssetGroup.id).where(
+                        AssetGroup.id == group_uuid,
+                        AssetGroup.workspace_id == ws_id,
+                    )
+                )
+                if found is None:
+                    errors.append("group not found in this workspace")
+
+    collision = (
+        await session.execute(
+            select(Asset.id, Asset.name).where(
+                Asset.workspace_id == ws_id,
+                func.lower(Asset.name) == clean_name.lower(),
+            )
+        )
+    ).first()
+
+    gain_loss = None
+    if value_today is not None and cost is not None:
+        gain_loss = float(value_today - cost)
+
+    preview = {
+        "kind": "create_asset",
+        "proposed": {
+            "name": clean_name,
+            "type": asset_type,
+            "currency": code,
+            "valuation_method": "manual",
+            "current_value": num(value_today),
+            "purchase_date": (
+                parsed_purchase_date.isoformat() if parsed_purchase_date else None
+            ),
+            "purchase_price": num(cost),
+            "sell_date": parsed_sell_date.isoformat() if parsed_sell_date else None,
+            "sell_price": num(proceeds),
+            "group_id": str(group_uuid) if group_uuid else None,
+        },
+        "gain_loss_if_applied": gain_loss,
+        "name_collision": (
+            {"id": str(collision.id), "name": collision.name} if collision else None
+        ),
+        "errors": errors,
+        "apply_endpoint": "POST /api/assets",
+    }
+
+    if not _can_apply(ctx, apply):
+        return preview
+    if errors:
+        return {**preview, "error": "; ".join(errors)}
+    if collision is not None:
+        return {**preview, "error": f"asset named {collision.name!r} already exists"}
+
+    created = await asset_service.create_asset(
+        session,
+        ws_id,
+        ctx.user_id,
+        AssetCreate(
+            name=clean_name,
+            type=asset_type,
+            currency=code,
+            valuation_method="manual",
+            current_value=value_today,
+            purchase_date=parsed_purchase_date,
+            purchase_price=cost,
+            sell_date=parsed_sell_date,
+            sell_price=proceeds,
+            group_id=group_uuid,
+        ),
+    )
+    return {
+        "kind": "create_asset",
+        "applied": True,
+        "id": str(created.id),
+        "name": created.name,
+        "type": created.type,
+        "currency": created.currency,
+        "current_value": num(created.current_value),
+        "purchase_price": num(created.purchase_price),
+        "sell_date": created.sell_date.isoformat() if created.sell_date else None,
+        "sell_price": num(created.sell_price),
+        "gain_loss": num(created.gain_loss),
+    }
 
 
 _LOT_SCHEMA = {
