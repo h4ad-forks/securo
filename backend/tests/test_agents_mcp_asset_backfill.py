@@ -509,3 +509,63 @@ async def test_apply_archive_writes(
     ).scalar_one()
     assert fresh is not None
     assert fresh.is_archived is True
+
+
+async def test_preview_update_asset_does_not_write(
+    session: AsyncSession, ctx: CallContext, manual_asset: Asset
+):
+    handler = REGISTRY["propose_update_asset"].handler
+    asset_id = manual_asset.id
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        asset_id=str(asset_id),
+        name="Hyundai i30 2011",
+    )
+
+    assert result["kind"] == "update_asset"
+    assert result["target"]["name"] == "AAPL34"
+    assert result["changes"]["name"] == "Hyundai i30 2011"
+
+    session.expire_all()
+    fresh = (
+        await session.execute(select(Asset).where(Asset.id == asset_id))
+    ).scalar_one()
+    assert fresh.name == "AAPL34"
+
+
+async def test_apply_update_asset_writes_name_and_value(
+    session: AsyncSession, ctx: CallContext, manual_asset: Asset
+):
+    handler = REGISTRY["propose_update_asset"].handler
+    asset_id = manual_asset.id
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        asset_id=str(asset_id),
+        name="Hyundai i30 2011",
+        current_value=32000,
+        current_value_date="2023-11-05",
+        apply=True,
+    )
+
+    assert result["applied"] is True
+    assert result["current_value_added"] is True
+
+    session.expire_all()
+    fresh = (
+        await session.execute(select(Asset).where(Asset.id == asset_id))
+    ).scalar_one()
+    assert fresh.name == "Hyundai i30 2011"
+    values = (
+        (
+            await session.execute(
+                select(AssetValue).where(AssetValue.asset_id == asset_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(values) == 1
+    assert float(values[0].amount) == 32000.0
+    assert values[0].date == date(2023, 11, 5)

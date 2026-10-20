@@ -34,13 +34,14 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.app_clock import app_today
 from app.models.asset import Asset
 from app.models.asset_group import AssetGroup
 from app.models.asset_transaction import AssetTransaction
 from app.models.asset_value import AssetValue
 from app.models.transaction import Transaction
 from app.models.workspace import Workspace
-from app.schemas.asset import AssetCreate, AssetUpdate
+from app.schemas.asset import AssetCreate, AssetUpdate, AssetValueCreate
 from app.services import asset_service
 from app.services.fx_rate_service import stamp_primary_amount
 from mcp_server.auth import CallContext
@@ -386,6 +387,253 @@ async def propose_archive_assets(
         if updated is not None:
             updated_count += 1
     return {**preview, "applied": True, "updated_count": updated_count}
+
+
+_UPDATE_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "asset_id": {"type": "string", "format": "uuid"},
+        "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": _MAX_ASSET_NAME,
+            "description": "New holding name, e.g. 'Hyundai i30 2011'.",
+        },
+        "type": {"type": "string", "enum": list(_ASSET_TYPES)},
+        "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+        "units": {"type": "number", "minimum": 0},
+        "purchase_date": {"type": "string", "format": "date"},
+        "purchase_price": {"type": "number", "exclusiveMinimum": 0},
+        "sell_date": {"type": "string", "format": "date"},
+        "sell_price": {"type": "number", "exclusiveMinimum": 0},
+        "is_archived": {"type": "boolean"},
+        "group_id": {"type": "string", "format": "uuid"},
+        "ticker": {"type": "string", "maxLength": 32},
+        "ticker_exchange": {"type": "string", "maxLength": 32},
+        "current_value": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": (
+                "Add a manual value point for the holding. Use "
+                "current_value_date to set the date; defaults to today."
+            ),
+        },
+        "current_value_date": {"type": "string", "format": "date"},
+        "apply": _APPLY_FIELD,
+    },
+    "required": ["asset_id"],
+    "additionalProperties": False,
+}
+
+
+def _asset_scalar(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return value
+
+
+@tool(
+    name="propose_update_asset",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Build a preview for editing one holding: name, type, currency, units, "
+        "purchase and sale fields, archive state, group and ticker. Pass only "
+        "the fields to change. Set current_value to add a manual value point "
+        "for the holding (current_value_date defaults to today). Returns the "
+        "current values next to the proposed ones and refuses a name collision."
+    ),
+    parameters=_UPDATE_PARAMETERS,
+    is_proposal=True,
+    tags=["propose", "assets"],
+)
+async def propose_update_asset(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    asset_id: str,
+    name: str | None = None,
+    type: str | None = None,
+    currency: str | None = None,
+    units: float | None = None,
+    purchase_date: str | None = None,
+    purchase_price: float | None = None,
+    sell_date: str | None = None,
+    sell_price: float | None = None,
+    is_archived: bool | None = None,
+    group_id: str | None = None,
+    ticker: str | None = None,
+    ticker_exchange: str | None = None,
+    current_value: float | None = None,
+    current_value_date: str | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    aid = parse_uuid(asset_id)
+    asset = (
+        (
+            await session.execute(
+                select(Asset).where(
+                    Asset.id == aid,
+                    Asset.workspace_id == ws_id,
+                )
+            )
+        )
+        .scalars()
+        .one_or_none()
+        if aid
+        else None
+    )
+    if asset is None:
+        return {"error": "asset not found"}
+
+    changes: dict[str, Any] = {}
+    if name is not None:
+        clean_name = " ".join(str(name).split())
+        if not clean_name:
+            return {"error": "name cannot be empty"}
+        if len(clean_name) > _MAX_ASSET_NAME:
+            return {"error": f"name must be at most {_MAX_ASSET_NAME} characters"}
+        changes["name"] = clean_name
+    if type is not None:
+        asset_type = str(type).strip().lower()
+        if asset_type not in _ASSET_TYPES:
+            return {"error": f"type must be one of {', '.join(_ASSET_TYPES)}"}
+        changes["type"] = asset_type
+    if currency is not None:
+        code = str(currency).strip().upper()
+        if len(code) != 3 or not code.isalpha():
+            return {"error": "currency must be a three-letter code"}
+        changes["currency"] = code
+    if units is not None:
+        if units < 0:
+            return {"error": "units cannot be negative"}
+        changes["units"] = Decimal(str(units))
+    if purchase_date is not None:
+        parsed = parse_date(purchase_date)
+        if parsed is None:
+            return {"error": "purchase_date cannot be empty"}
+        changes["purchase_date"] = parsed
+    if purchase_price is not None:
+        if purchase_price <= 0:
+            return {"error": "purchase_price must be greater than zero"}
+        changes["purchase_price"] = Decimal(str(purchase_price))
+    if sell_date is not None:
+        parsed = parse_date(sell_date)
+        if parsed is None:
+            return {"error": "sell_date cannot be empty"}
+        changes["sell_date"] = parsed
+    if sell_price is not None:
+        if sell_price <= 0:
+            return {"error": "sell_price must be greater than zero"}
+        changes["sell_price"] = Decimal(str(sell_price))
+    if is_archived is not None:
+        changes["is_archived"] = bool(is_archived)
+    if group_id is not None:
+        parsed_group = parse_uuid(group_id)
+        if parsed_group is None:
+            return {"error": "group_id cannot be empty"}
+        changes["group_id"] = parsed_group
+    if ticker is not None:
+        changes["ticker"] = ticker.strip()
+    if ticker_exchange is not None:
+        changes["ticker_exchange"] = ticker_exchange.strip()
+    if current_value is not None and current_value <= 0:
+        return {"error": "current_value must be greater than zero"}
+
+    if not changes and current_value is None:
+        return {"error": "no changes provided"}
+
+    collision = None
+    if "name" in changes:
+        collision = (
+            await session.execute(
+                select(Asset.id, Asset.name).where(
+                    Asset.workspace_id == ws_id,
+                    func.lower(Asset.name) == changes["name"].lower(),
+                    Asset.id != asset.id,
+                )
+            )
+        ).first()
+
+    parsed_value_date = (
+        parse_date(current_value_date) if current_value_date else app_today()
+    )
+    preview = {
+        "kind": "update_asset",
+        "target": {
+            "id": str(asset.id),
+            "name": asset.name,
+            "type": asset.type,
+            "currency": asset.currency,
+            "units": num(asset.units),
+            "purchase_date": (
+                asset.purchase_date.isoformat() if asset.purchase_date else None
+            ),
+            "purchase_price": num(asset.purchase_price),
+            "sell_date": asset.sell_date.isoformat() if asset.sell_date else None,
+            "sell_price": num(asset.sell_price),
+            "is_archived": bool(asset.is_archived),
+            "group_id": str(asset.group_id) if asset.group_id else None,
+            "ticker": asset.ticker,
+            "ticker_exchange": asset.ticker_exchange,
+        },
+        "changes": {key: _asset_scalar(value) for key, value in changes.items()},
+        "current_value": (
+            {
+                "amount": float(current_value),
+                "date": parsed_value_date.isoformat() if parsed_value_date else None,
+            }
+            if current_value is not None
+            else None
+        ),
+        "name_collision": (
+            {"id": str(collision.id), "name": collision.name} if collision else None
+        ),
+        "apply_endpoint": f"PATCH /api/assets/{asset.id}",
+    }
+
+    if not _can_apply(ctx, apply):
+        return preview
+    if collision is not None:
+        return {
+            **preview,
+            "error": f"asset named {collision.name!r} already exists",
+        }
+
+    try:
+        updated = None
+        if changes:
+            updated = await asset_service.update_asset(
+                session,
+                asset.id,
+                ws_id,
+                ctx.user_id,
+                AssetUpdate(**changes),
+            )
+        if current_value is not None:
+            await asset_service.add_asset_value(
+                session,
+                asset.id,
+                ws_id,
+                AssetValueCreate(
+                    amount=Decimal(str(current_value)),
+                    date=parsed_value_date or app_today(),
+                ),
+            )
+    except ValueError as exc:
+        return {**preview, "applied": False, "error": str(exc)}
+
+    return {
+        **preview,
+        "applied": True,
+        "id": str(asset.id),
+        "updated": updated is not None,
+        "current_value_added": current_value is not None,
+    }
 
 
 _LOT_SCHEMA = {

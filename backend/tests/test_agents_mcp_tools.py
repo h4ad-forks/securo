@@ -59,6 +59,7 @@ def test_registry_contains_v1_tools():
         "propose_asset_purchase_backfill",
         "propose_create_asset",
         "propose_archive_assets",
+        "propose_update_asset",
         "propose_update_transaction",
     }
     assert expected.issubset(set(REGISTRY.keys())), (
@@ -78,6 +79,7 @@ def test_proposal_tools_marked_is_proposal():
         "propose_asset_purchase_backfill",
         "propose_create_asset",
         "propose_archive_assets",
+        "propose_update_asset",
         "propose_update_transaction",
     ):
         spec = REGISTRY[name]
