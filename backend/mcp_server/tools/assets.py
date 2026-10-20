@@ -40,12 +40,12 @@ from app.models.asset_transaction import AssetTransaction
 from app.models.asset_value import AssetValue
 from app.models.transaction import Transaction
 from app.models.workspace import Workspace
-from app.schemas.asset import AssetCreate
+from app.schemas.asset import AssetCreate, AssetUpdate
 from app.services import asset_service
 from app.services.fx_rate_service import stamp_primary_amount
 from mcp_server.auth import CallContext
 from mcp_server.registry import tool
-from mcp_server.tools._helpers import num, parse_date, parse_uuid, resolve_workspace_id
+from mcp_server.tools._helpers import num, parse_date, parse_uuid, parse_uuid_list, resolve_workspace_id
 from mcp_server.tools.proposals import _APPLY_FIELD, _PROPOSAL_PREFACE, _can_apply
 
 
@@ -288,6 +288,104 @@ async def propose_create_asset(
         "sell_price": num(created.sell_price),
         "gain_loss": num(created.gain_loss),
     }
+
+
+_ARCHIVE_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "asset_ids": {
+            "type": "array",
+            "items": {"type": "string", "format": "uuid"},
+            "minItems": 1,
+            "description": "Holdings to archive or restore.",
+        },
+        "is_archived": {
+            "type": "boolean",
+            "default": True,
+            "description": "True archives, false restores.",
+        },
+        "apply": _APPLY_FIELD,
+    },
+    "required": ["asset_ids"],
+    "additionalProperties": False,
+}
+
+
+@tool(
+    name="propose_archive_assets",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Archive or restore one or more holdings. Archiving keeps the history "
+        "and removes the holding from net worth and list views; "
+        "is_archived=false restores it. Use it when replacing provider-synced "
+        "holdings with a consolidated manual asset, so the same value is not "
+        "counted twice."
+    ),
+    parameters=_ARCHIVE_PARAMETERS,
+    is_proposal=True,
+    tags=["propose", "assets"],
+)
+async def propose_archive_assets(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    asset_ids: list[str],
+    is_archived: bool = True,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    parsed_ids = parse_uuid_list(asset_ids) or []
+    if not parsed_ids:
+        return {"error": "asset_ids is required"}
+
+    assets = (
+        (
+            await session.execute(
+                select(Asset).where(
+                    Asset.id.in_(parsed_ids),
+                    Asset.workspace_id == ws_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    found = {asset.id for asset in assets}
+    preview = {
+        "kind": "archive_assets",
+        "is_archived": bool(is_archived),
+        "assets": [
+            {
+                "id": str(asset.id),
+                "name": asset.name,
+                "type": asset.type,
+                "source": asset.source,
+                "purchase_price": num(asset.purchase_price),
+                "is_archived": bool(asset.is_archived),
+            }
+            for asset in assets
+        ],
+        "missing_ids": [
+            str(asset_id) for asset_id in parsed_ids if asset_id not in found
+        ],
+        "apply_endpoint": "PATCH /api/assets/{id}",
+    }
+
+    if not _can_apply(ctx, apply):
+        return preview
+
+    updated_count = 0
+    for asset in assets:
+        updated = await asset_service.update_asset(
+            session,
+            asset.id,
+            ws_id,
+            ctx.user_id,
+            AssetUpdate(is_archived=bool(is_archived)),
+        )
+        if updated is not None:
+            updated_count += 1
+    return {**preview, "applied": True, "updated_count": updated_count}
 
 
 _LOT_SCHEMA = {

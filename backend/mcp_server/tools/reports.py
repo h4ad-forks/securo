@@ -85,6 +85,16 @@ async def get_income_expenses(
         "properties": {
             "months": {"type": "integer", "minimum": 1, "maximum": 24, "default": 6},
             "interval": {"type": "string", "enum": ["daily", "weekly", "monthly"], "default": "daily"},
+            "baseline": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Use the historical-mean baseline for the projection "
+                    "instead of only recurring rows. This is the realistic "
+                    "view when income is variable and not recorded as a "
+                    "recurring transaction."
+                ),
+            },
         },
         "additionalProperties": False,
     },
@@ -96,10 +106,17 @@ async def get_cash_flow(
     ctx: CallContext,
     months: int = 6,
     interval: str = "daily",
+    baseline: bool = False,
 ) -> dict[str, Any]:
     ws_id = await resolve_workspace_id(session, ctx)
     rep = await report_service.get_cash_flow_report(
-        session, ws_id, ctx.user_id, months=int(months), interval=interval, currency=_pri_currency(ctx)
+        session,
+        ws_id,
+        ctx.user_id,
+        months=int(months),
+        interval=interval,
+        currency=_pri_currency(ctx),
+        baseline=bool(baseline),
     )
     return _serialize_report(rep)
 

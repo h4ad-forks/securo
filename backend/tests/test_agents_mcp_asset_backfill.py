@@ -462,3 +462,50 @@ async def test_create_asset_apply_writes_row_and_value(
     )
     assert len(values) == 1
     assert float(values[0].amount) == 32000.0
+
+
+async def test_preview_archive_does_not_write(
+    session: AsyncSession, ctx: CallContext, manual_asset: Asset
+):
+    handler = REGISTRY["propose_archive_assets"].handler
+    asset_id = manual_asset.id
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        asset_ids=[str(asset_id)],
+    )
+
+    assert result["kind"] == "archive_assets"
+    assert result["is_archived"] is True
+    assert result["assets"][0]["id"] == str(asset_id)
+    assert result["assets"][0]["is_archived"] is False
+
+    session.expire_all()
+    fresh = (
+        await session.execute(select(Asset).where(Asset.id == asset_id))
+    ).scalar_one()
+    assert fresh is not None
+    assert fresh.is_archived is False
+
+
+async def test_apply_archive_writes(
+    session: AsyncSession, ctx: CallContext, manual_asset: Asset
+):
+    handler = REGISTRY["propose_archive_assets"].handler
+    asset_id = manual_asset.id
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        asset_ids=[str(asset_id)],
+        apply=True,
+    )
+
+    assert result["applied"] is True
+    assert result["updated_count"] == 1
+
+    session.expire_all()
+    fresh = (
+        await session.execute(select(Asset).where(Asset.id == asset_id))
+    ).scalar_one()
+    assert fresh is not None
+    assert fresh.is_archived is True

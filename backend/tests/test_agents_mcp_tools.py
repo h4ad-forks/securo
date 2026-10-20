@@ -58,6 +58,7 @@ def test_registry_contains_v1_tools():
         "list_goals",
         "propose_asset_purchase_backfill",
         "propose_create_asset",
+        "propose_archive_assets",
         "propose_update_transaction",
     }
     assert expected.issubset(set(REGISTRY.keys())), (
@@ -76,6 +77,7 @@ def test_proposal_tools_marked_is_proposal():
         "propose_create_payee",
         "propose_asset_purchase_backfill",
         "propose_create_asset",
+        "propose_archive_assets",
         "propose_update_transaction",
     ):
         spec = REGISTRY[name]
@@ -86,6 +88,12 @@ def test_each_tool_has_input_schema():
     for name, spec in REGISTRY.items():
         assert spec.parameters.get("type") == "object", f"{name} schema must be object"
         assert "properties" in spec.parameters
+
+
+def test_cash_flow_exposes_baseline():
+    properties = REGISTRY["get_cash_flow"].parameters["properties"]
+    assert "baseline" in properties
+    assert properties["baseline"]["default"] is False
 
 
 @pytest.mark.parametrize(
